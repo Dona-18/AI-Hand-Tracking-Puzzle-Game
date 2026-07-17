@@ -60,8 +60,8 @@ Interact with the game using these precise, real-time hand gestures tracked from
 
 | Gesture | Graphic Trigger | Visual Feedback | Action in Game |
 | :--- | :--- | :--- | :--- |
-| **Open Palm** | 4 or 5 fingers extended | Orange/Cyan radial countdown ring around cursor | **Hold for 1.2s:** Starts the 3-second camera countdown (Start state) |
-| **Pinch** | Distance between Thumb Tip (4) & Index Tip (8) < `35px` | Active green connection line and green cursor ring | **Hold and drag:** Grabs and drags the puzzle piece beneath the cursor |
+| **Open Palm** | Index, middle, ring & pinky fingers extended | Orange/Cyan radial countdown ring around cursor | **Hold for 1.2s:** Starts the 3-second camera countdown (Start state) |
+| **Pinch** | Thumb-to-index distance below ~40% of palm size (distance-invariant, with hysteresis) | Active green connection line and green cursor ring | **Hold and drag:** Grabs and drags the puzzle piece beneath the cursor |
 | **Point** | Only index finger extended, others closed | Orange dual cursor rings | Hover and explore pieces without triggering actions |
 | **Fist** | All fingers completely closed | Orange/Cyan radial progress ring around cursor | **Hold for 1.2s:** Reshuffles pieces (Playing state) or Resets game (Completed state) |
 | **None / Neutral**| Any other posture | White cursor dot | Default hover tracking |
@@ -167,13 +167,20 @@ class Config:
     GRID_SIZE = 3               # <-- Set to 2 (easy 2x2), 3 (normal 3x3), or 4 (hard 4x4)
     
     # Gesture & Game Physics Sensitivity
-    PINCH_THRESHOLD = 35        # <-- Maximum distance (pixels) between fingers to pinch
+    PINCH_ENGAGE_RATIO = 0.40   # <-- Pinch starts below this thumb-index / palm-size ratio
+    PINCH_RELEASE_RATIO = 0.60  # <-- Pinch ends above this ratio (hysteresis stops flicker)
     SNAP_DISTANCE = 40          # <-- Distance (pixels) to automatically snap a piece
     GESTURE_HOLD_DURATION = 1.2 # <-- Hold duration (seconds) to trigger fist/open palm actions
-    
+    GESTURE_STABLE_FRAMES = 3   # <-- Frames a new gesture must persist before it registers
+    RELEASE_GRACE_SEC = 0.15    # <-- Keep dragging through tracking dropouts this long
+
+    # Landmark smoothing (velocity-adaptive): lower MIN = steadier cursor when still
+    SMOOTHING_MIN_ALPHA = 0.25
+    SMOOTHING_MAX_ALPHA = 0.90
+
     # MediaPipe Hands confidence thresholds
-    DETECTION_CONFIDENCE = 0.7  # <-- High values improve accuracy but require good lighting
-    TRACKING_CONFIDENCE = 0.7
+    DETECTION_CONFIDENCE = 0.6  # <-- Higher values reduce false hands but require good lighting
+    TRACKING_CONFIDENCE = 0.6
     
     # Camera hardware configurations
     CAMERA_INDEX = 0            # <-- Try 1, 2, or -1 if using external webcams
@@ -228,8 +235,8 @@ The main rendering and state loop coordinator. It:
 ### 🔵 Problem 3: Difficult to pinch or drag pieces
 *   **Reason:** Hand is too far away from the webcam, or lighting conditions are poor.
 *   **Solution:**
-    *   Move your hand closer to the camera.
-    *   Increase the pinch threshold value in `Config.PINCH_THRESHOLD` (e.g. change it from `35` to `45` or `50`).
+    *   Pinch detection is now normalized by palm size, so camera distance matters much less. If pinching is still hard, raise `Config.PINCH_ENGAGE_RATIO` (e.g. `0.40` to `0.45`).
+    *   If pieces drop mid-drag, raise `Config.PINCH_RELEASE_RATIO` (e.g. `0.60` to `0.70`) or `Config.RELEASE_GRACE_SEC`.
     *   Ensure the hand is well-lit and stands out from background noise.
 
 ### 🟢 Problem 4: Pieces snap too early or fail to snap

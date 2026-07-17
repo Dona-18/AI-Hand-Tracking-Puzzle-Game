@@ -30,13 +30,24 @@ class Config:
     GRID_SIZE = 3  # Dynamically creates a grid_size x grid_size puzzle (e.g. 3x3, 4x4)
     
     # Hand tracking & gesture parameters
-    PINCH_THRESHOLD = 35        # Max pixel distance between thumb and index tip to pinch
+    # Pinch thresholds are ratios of the thumb-index distance to the palm size
+    # (wrist to middle-finger knuckle), so pinching works at any distance from
+    # the camera instead of relying on a fixed pixel distance.
+    PINCH_ENGAGE_RATIO = 0.40   # Pinch starts when ratio drops below this
+    PINCH_RELEASE_RATIO = 0.60  # Pinch ends when ratio rises above this (hysteresis stops flicker)
     SNAP_DISTANCE = 40          # Distance in pixels to snap a piece to its target slot
     GESTURE_HOLD_DURATION = 1.2 # Time in seconds to hold open palm / fist for triggers
-    
+    GESTURE_STABLE_FRAMES = 3   # Frames a new gesture must persist before it registers
+    RELEASE_GRACE_SEC = 0.15    # Keep dragging through tracking dropouts shorter than this
+
+    # Landmark smoothing (velocity-adaptive EMA): low alpha = smooth/steady,
+    # high alpha = responsive. The filter blends between these based on hand speed.
+    SMOOTHING_MIN_ALPHA = 0.25
+    SMOOTHING_MAX_ALPHA = 0.90
+
     # MediaPipe Hands confidence thresholds
-    DETECTION_CONFIDENCE = 0.7
-    TRACKING_CONFIDENCE = 0.7
+    DETECTION_CONFIDENCE = 0.6
+    TRACKING_CONFIDENCE = 0.6
     
     # Camera hardware index
     CAMERA_INDEX = 0
@@ -88,60 +99,128 @@ class GestureDetector:
         # Gesture hold timers
         self.gesture_hold_start: Optional[float] = None
         self.current_held_gesture: Optional[str] = None
-        
+
+        # Landmark smoothing state (velocity-adaptive EMA)
+        self.smoothed_landmarks: Optional[List[Tuple[float, float]]] = None
+        self.frames_without_hand = 0
+
+        # Pinch hysteresis and gesture debounce state
+        self.is_pinching = False
+        self.stable_gesture = "NONE"
+        self.candidate_gesture = "NONE"
+        self.candidate_count = 0
+
     def find_hand_landmarks(self, frame_rgb: np.ndarray) -> Optional[List[Tuple[int, int]]]:
-        """Runs the MediaPipe pipeline and extracts landmark pixel coordinates."""
+        """Runs the MediaPipe pipeline and extracts smoothed landmark pixel coordinates."""
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
         timestamp_ms = int(time.monotonic() * 1000)
-        
+
         detection_result = self.detector.detect_for_video(mp_image, timestamp_ms)
         if not detection_result.hand_landmarks:
+            # Only reset the smoothing filter after the hand has been gone a while,
+            # so a single dropped frame doesn't cause a cursor jump on re-detection.
+            self.frames_without_hand += 1
+            if self.frames_without_hand > 5:
+                self.smoothed_landmarks = None
             return None
-        
-        landmarks = []
+        self.frames_without_hand = 0
+
         # Process only the first hand detected
         hand_lms = detection_result.hand_landmarks[0]
-        for lm in hand_lms:
-            px = int(lm.x * Config.WINDOW_WIDTH)
-            py = int(lm.y * Config.WINDOW_HEIGHT)
-            landmarks.append((px, py))
-            
-        return landmarks
+        raw = [(lm.x * Config.WINDOW_WIDTH, lm.y * Config.WINDOW_HEIGHT) for lm in hand_lms]
+
+        if self.smoothed_landmarks is None:
+            self.smoothed_landmarks = raw
+        else:
+            # Per-landmark adaptive smoothing: a still hand gets heavy smoothing to
+            # kill jitter, a fast-moving hand gets light smoothing to avoid lag.
+            smoothed = []
+            for (rx, ry), (sx, sy) in zip(raw, self.smoothed_landmarks):
+                speed = math.hypot(rx - sx, ry - sy)
+                alpha = min(Config.SMOOTHING_MAX_ALPHA,
+                            Config.SMOOTHING_MIN_ALPHA + speed / 40.0)
+                smoothed.append((alpha * rx + (1 - alpha) * sx,
+                                 alpha * ry + (1 - alpha) * sy))
+            self.smoothed_landmarks = smoothed
+
+        return [(int(x), int(y)) for x, y in self.smoothed_landmarks]
 
     def get_gesture(self, lm: List[Tuple[int, int]]) -> str:
         """Determines the current active gesture from hand landmark positions."""
         def get_dist(p1: Tuple[int, int], p2: Tuple[int, int]) -> float:
             return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
-            
-        # 1. Pinch detection (highest priority gesture for tracking piece drag)
-        pinch_dist = get_dist(lm[4], lm[8])
-        if pinch_dist < Config.PINCH_THRESHOLD:
+
+        wrist = lm[0]
+        # Palm size (wrist to middle-finger MCP) normalizes all thresholds so the
+        # same gestures work whether the hand is near or far from the camera.
+        hand_scale = get_dist(wrist, lm[9])
+        if hand_scale < 1.0:
+            return "NONE"
+
+        # 1. Pinch detection with hysteresis: engage below one ratio, release above
+        # a higher one, so the pinch can't flicker on/off at the boundary mid-drag.
+        pinch_ratio = get_dist(lm[4], lm[8]) / hand_scale
+        if self.is_pinching:
+            if pinch_ratio > Config.PINCH_RELEASE_RATIO:
+                self.is_pinching = False
+        elif pinch_ratio < Config.PINCH_ENGAGE_RATIO:
+            self.is_pinching = True
+
+        if self.is_pinching:
+            self.stable_gesture = "PINCH"
+            self.candidate_count = 0
             return "PINCH"
-            
-        # Check extensions of fingers relative to joints (Y axis check in mirrored space)
-        index_ext = lm[8][1] < lm[6][1]
-        middle_ext = lm[12][1] < lm[10][1]
-        ring_ext = lm[16][1] < lm[14][1]
-        pinky_ext = lm[20][1] < lm[18][1]
-        
-        # Thumb: extended if distance from thumb tip (4) to middle MCP (9) is greater than IP (3) to middle MCP (9)
-        thumb_ext = get_dist(lm[4], lm[9]) > get_dist(lm[3], lm[9])
-        
-        extended_count = sum([index_ext, middle_ext, ring_ext, pinky_ext, thumb_ext])
-        
-        # 2. Fist: all fingers closed
-        if extended_count == 0:
-            return "FIST"
-            
-        # 3. Open Palm: at least 4 fingers extended
-        if extended_count >= 4:
-            return "OPEN PALM"
-            
-        # 4. Point: index is extended, middle/ring/pinky are folded
-        if index_ext and not middle_ext and not ring_ext and not pinky_ext:
-            return "POINT"
-            
-        return "NONE"
+
+        # Finger extended if its tip is farther from the wrist than its PIP joint.
+        # Distance-based, so it keeps working when the hand is tilted or rotated,
+        # unlike a raw Y-coordinate comparison.
+        def finger_extended(tip: int, pip: int) -> bool:
+            return get_dist(lm[tip], wrist) > get_dist(lm[pip], wrist) * 1.05
+
+        index_ext = finger_extended(8, 6)
+        middle_ext = finger_extended(12, 10)
+        ring_ext = finger_extended(16, 14)
+        pinky_ext = finger_extended(20, 18)
+
+        # Fist and open palm ignore the thumb: it often reads as "extended" in a
+        # real fist, which made FIST nearly impossible to trigger.
+        if not (index_ext or middle_ext or ring_ext or pinky_ext):
+            raw_gesture = "FIST"
+        elif index_ext and middle_ext and ring_ext and pinky_ext:
+            raw_gesture = "OPEN PALM"
+        elif index_ext and not middle_ext and not ring_ext and not pinky_ext:
+            raw_gesture = "POINT"
+        else:
+            raw_gesture = "NONE"
+
+        # Pinch release bypasses the debounce below — hysteresis already stabilizes
+        # the pinch, and lingering on "PINCH" would delay dropping a piece.
+        if self.stable_gesture == "PINCH":
+            self.stable_gesture = raw_gesture
+            self.candidate_count = 0
+            return raw_gesture
+
+        # Debounce: a new gesture must persist for a few consecutive frames before
+        # it is reported, so single-frame misclassifications don't flip game state.
+        if raw_gesture == self.stable_gesture:
+            self.candidate_count = 0
+        elif raw_gesture == self.candidate_gesture:
+            self.candidate_count += 1
+            if self.candidate_count >= Config.GESTURE_STABLE_FRAMES:
+                self.stable_gesture = raw_gesture
+                self.candidate_count = 0
+        else:
+            self.candidate_gesture = raw_gesture
+            self.candidate_count = 1
+
+        return self.stable_gesture
+
+    def get_cursor(self, lm: List[Tuple[int, int]], gesture: str) -> Tuple[int, int]:
+        """Returns the active cursor point: pinch midpoint while pinching (matches
+        where the user physically grips), index fingertip otherwise."""
+        if gesture == "PINCH":
+            return ((lm[4][0] + lm[8][0]) // 2, (lm[4][1] + lm[8][1]) // 2)
+        return lm[8]
 
     def update_hold_gesture(self, gesture: str) -> Tuple[Optional[str], float]:
         """
@@ -202,6 +281,7 @@ class PuzzleGame:
         self.dragged_piece: Optional[PuzzlePiece] = None
         self.drag_offset_x = 0
         self.drag_offset_y = 0
+        self.pinch_lost_at: Optional[float] = None
         
         self.current_frame: Optional[np.ndarray] = None
         self.cap: Optional[cv2.VideoCapture] = None
@@ -268,6 +348,7 @@ class PuzzleGame:
                 
         elif self.state == STATE_PLAYING:
             if gesture == "PINCH" and cursor_pos:
+                self.pinch_lost_at = None
                 cx, cy = cursor_pos
                 if self.dragged_piece is None:
                     # Look for pieces under the cursor. Loop reversed to pick up top-most piece first
@@ -294,6 +375,14 @@ class PuzzleGame:
             else:
                 # Gesture is not a PINCH, handle releases
                 if self.dragged_piece is not None:
+                    # Grace window: brief tracking dropouts (hand lost for a frame
+                    # or two) keep the piece held instead of dropping it instantly.
+                    now = time.monotonic()
+                    if self.pinch_lost_at is None:
+                        self.pinch_lost_at = now
+                    if now - self.pinch_lost_at < Config.RELEASE_GRACE_SEC:
+                        return
+                    self.pinch_lost_at = None
                     p = self.dragged_piece
                     # Calculate Euclidean distance to destination coordinates
                     dist = math.hypot(p.current_x - p.correct_x, p.current_y - p.correct_y)
@@ -580,7 +669,7 @@ class PuzzleGame:
             
             if landmarks:
                 gesture = detector.get_gesture(landmarks)
-                cursor_pos = landmarks[8] # Index fingertip
+                cursor_pos = detector.get_cursor(landmarks, gesture)
                 
             # Parse timing events for held gestures
             triggered_gesture, hold_progress = detector.update_hold_gesture(gesture)
