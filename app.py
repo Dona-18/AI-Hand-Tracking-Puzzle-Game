@@ -1,5 +1,9 @@
+import os
+import urllib.request
 import cv2
 import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
 import numpy as np
 import time
 import math
@@ -57,13 +61,29 @@ class PuzzlePiece:
 class GestureDetector:
     """Handles MediaPipe Hand detection and maps hand landmarks to predefined game gestures."""
     def __init__(self):
-        self.mp_hands = mp.solutions.hands
-        self.hands = self.mp_hands.Hands(
-            static_image_mode=False,
-            max_num_hands=1,
-            min_detection_confidence=Config.DETECTION_CONFIDENCE,
+        # Ensure hand landmarker model is downloaded
+        model_path = "hand_landmarker.task"
+        if not os.path.exists(model_path):
+            print("Downloading hand_landmarker.task model...")
+            url = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
+            try:
+                urllib.request.urlretrieve(url, model_path)
+                print("Download complete.")
+            except Exception as e:
+                print(f"Error downloading model: {e}")
+                raise RuntimeError(f"Could not download hand_landmarker.task: {e}")
+        
+        # Configure detector options
+        base_options = python.BaseOptions(model_asset_path=model_path)
+        options = vision.HandLandmarkerOptions(
+            base_options=base_options,
+            running_mode=vision.RunningMode.VIDEO,
+            num_hands=1,
+            min_hand_detection_confidence=Config.DETECTION_CONFIDENCE,
+            min_hand_presence_confidence=Config.TRACKING_CONFIDENCE,
             min_tracking_confidence=Config.TRACKING_CONFIDENCE
         )
+        self.detector = vision.HandLandmarker.create_from_options(options)
         
         # Gesture hold timers
         self.gesture_hold_start: Optional[float] = None
@@ -71,14 +91,17 @@ class GestureDetector:
         
     def find_hand_landmarks(self, frame_rgb: np.ndarray) -> Optional[List[Tuple[int, int]]]:
         """Runs the MediaPipe pipeline and extracts landmark pixel coordinates."""
-        results = self.hands.process(frame_rgb)
-        if not results.multi_hand_landmarks:
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+        timestamp_ms = int(time.monotonic() * 1000)
+        
+        detection_result = self.detector.detect_for_video(mp_image, timestamp_ms)
+        if not detection_result.hand_landmarks:
             return None
         
         landmarks = []
         # Process only the first hand detected
-        hand_lms = results.multi_hand_landmarks[0]
-        for lm in hand_lms.landmark:
+        hand_lms = detection_result.hand_landmarks[0]
+        for lm in hand_lms:
             px = int(lm.x * Config.WINDOW_WIDTH)
             py = int(lm.y * Config.WINDOW_HEIGHT)
             landmarks.append((px, py))

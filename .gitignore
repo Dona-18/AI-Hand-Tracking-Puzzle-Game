@@ -33,3 +33,6 @@ venv.bak/
 *.swp
 *.swo
 .DS_Store
+
+# MediaPipe model files
+*.task
